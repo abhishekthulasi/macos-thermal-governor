@@ -1,15 +1,28 @@
-use std::ffi::{c_char, c_int};
-use std::fs::File;
-use std::io::Read;
-use std::os::fd::{FromRawFd, IntoRawFd};
+use std::ffi::{c_char, c_int, c_void};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const NOTIFY_STATUS_OK: u32 = 0;
 const NOTIFY_KEY: &[u8] = b"com.apple.system.thermalpressurelevel\0";
 
-static RUNNING: AtomicBool = AtomicBool::new(true);
+const EVFILT_READ: i16 = -1;
+const EVFILT_SIGNAL: i16 = -6;
+const EV_ADD: u16 = 0x0001;
+const EV_ENABLE: u16 = 0x0004;
+
+const SIGINT: c_int = 2;
+const SIGTERM: c_int = 15;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct Kevent {
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: isize,
+    udata: *mut c_void,
+}
 
 #[link(name = "System")]
 unsafe extern "C" {
@@ -22,10 +35,22 @@ unsafe extern "C" {
 
     fn notify_get_state(token: c_int, state64: *mut u64) -> u32;
     fn notify_cancel(token: c_int) -> u32;
+
+    fn kqueue() -> c_int;
+    fn kevent(
+        kq: c_int,
+        changelist: *const Kevent,
+        nchanges: c_int,
+        eventlist: *mut Kevent,
+        nevents: c_int,
+        timeout: *const c_void,
+    ) -> c_int;
+
     fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
+    fn read(fd: c_int, buf: *mut u8, count: usize) -> isize;
+    fn close(fd: c_int) -> c_int;
 }
 
-/// Formats current UTC time as YYYY-MM-DD HH:MM:SS using standard library time.
 fn format_timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -36,7 +61,6 @@ fn format_timestamp() -> String {
     let min = (secs / 60) % 60;
     let hour = (secs / 3600) % 24;
 
-    // Convert epoch days to Gregorian date (civil calendar algorithm)
     let days = (secs / 86400) as i64;
     let z = days + 719468;
     let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
@@ -60,8 +84,9 @@ macro_rules! log {
     }};
 }
 
-extern "C" fn handle_sigterm(_: c_int) {
-    RUNNING.store(false, Ordering::SeqCst);
+extern "C" fn handle_signal(_: c_int) {
+    // No-op: kevent catches EVFILT_SIGNAL synchronously.
+    // Registering a trivial handler prevents Darwin's default SIG_DFL termination.
 }
 
 fn set_low_power_mode(enable: bool) {
@@ -89,9 +114,10 @@ fn describe_pressure_level(level: u64) -> &'static str {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Intercept SIGTERM from launchd for a graceful exit
+    // Intercept termination signals without executing default abort actions
     unsafe {
-        signal(15, handle_sigterm); // 15 = SIGTERM
+        signal(SIGTERM, handle_signal);
+        signal(SIGINT, handle_signal);
     }
 
     let mut notify_fd: c_int = -1;
@@ -111,6 +137,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    let kq = unsafe { kqueue() };
+    if kq < 0 {
+        log!("Failed to create kqueue descriptor");
+        unsafe {
+            close(notify_fd);
+            notify_cancel(token);
+        }
+        std::process::exit(1);
+    }
+
+    // Subscribe to incoming pipe data and OS termination signals in a single kernel queue
+    let change_list = [
+        Kevent {
+            ident: notify_fd as usize,
+            filter: EVFILT_READ,
+            flags: EV_ADD | EV_ENABLE,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        },
+        Kevent {
+            ident: SIGTERM as usize,
+            filter: EVFILT_SIGNAL,
+            flags: EV_ADD | EV_ENABLE,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        },
+        Kevent {
+            ident: SIGINT as usize,
+            filter: EVFILT_SIGNAL,
+            flags: EV_ADD | EV_ENABLE,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        },
+    ];
+
+    let register_status = unsafe {
+        kevent(
+            kq,
+            change_list.as_ptr(),
+            change_list.len() as c_int,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+
+    if register_status < 0 {
+        log!("Failed to register kqueue filters");
+        unsafe {
+            close(notify_fd);
+            close(kq);
+            notify_cancel(token);
+        }
+        std::process::exit(1);
+    }
+
     let mut current_state: u64 = 0;
     unsafe { notify_get_state(token, &mut current_state) };
 
@@ -120,46 +205,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         describe_pressure_level(current_state)
     );
 
-    // Initial state evaluation
     let mut lpm_active = current_state >= 2;
     if lpm_active {
         set_low_power_mode(true);
     }
 
-    let mut stream = unsafe { File::from_raw_fd(notify_fd) };
+    let mut event = std::mem::MaybeUninit::<Kevent>::uninit();
     let mut token_buf = [0u8; 4];
 
-    while RUNNING.load(Ordering::SeqCst) && stream.read_exact(&mut token_buf).is_ok() {
-        let mut new_state: u64 = 0;
-        let query_status = unsafe { notify_get_state(token, &mut new_state) };
+    loop {
+        // Blocks indefinitely with NULL timeout until the kernel pushes an event
+        let n = unsafe {
+            kevent(
+                kq,
+                std::ptr::null(),
+                0,
+                event.as_mut_ptr(),
+                1,
+                std::ptr::null(), // NULL = 0 timer wakeups, pure interrupt-driven sleep
+            )
+        };
 
-        if query_status == NOTIFY_STATUS_OK && new_state != current_state {
-            log!(
-                "Transition: [{}] {} -> [{}] {}",
-                current_state,
-                describe_pressure_level(current_state),
-                new_state,
-                describe_pressure_level(new_state)
-            );
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(4) {
+                // EINTR: an unmonitored signal hit the thread, safely re-enter kevent
+                continue;
+            }
+            log!("kevent error: {err}");
+            break;
+        }
 
-            let should_enable_lpm = new_state >= 2;
-            if should_enable_lpm != lpm_active {
-                set_low_power_mode(should_enable_lpm);
-                lpm_active = should_enable_lpm;
+        if n == 0 {
+            continue;
+        }
+
+        let ev = unsafe { event.assume_init() };
+
+        // Synchronous shutdown signal from launchctl or terminal
+        if ev.filter == EVFILT_SIGNAL {
+            log!("Received termination signal ({}), shutting down...", ev.ident);
+            break;
+        }
+
+        // Thermal event posted to notify_fd
+        if ev.filter == EVFILT_READ && ev.ident == notify_fd as usize {
+            let bytes_read = unsafe { read(notify_fd, token_buf.as_mut_ptr(), token_buf.len()) };
+            if bytes_read <= 0 {
+                log!("Notification pipe closed unexpectedly");
+                break;
             }
 
-            current_state = new_state;
+            let mut new_state: u64 = 0;
+            let query_status = unsafe { notify_get_state(token, &mut new_state) };
+
+            if query_status == NOTIFY_STATUS_OK && new_state != current_state {
+                log!(
+                    "Transition: [{}] {} -> [{}] {}",
+                    current_state,
+                    describe_pressure_level(current_state),
+                    new_state,
+                    describe_pressure_level(new_state)
+                );
+
+                let should_enable_lpm = new_state >= 2;
+                if should_enable_lpm != lpm_active {
+                    set_low_power_mode(should_enable_lpm);
+                    lpm_active = should_enable_lpm;
+                }
+
+                current_state = new_state;
+            }
         }
     }
 
-    // Cleanup when stopping the daemon
+    // Guaranteed cleanup before exit
     if lpm_active {
         set_low_power_mode(false);
     }
 
-    let _ = stream.into_raw_fd();
-    unsafe { notify_cancel(token) };
-    log!("Terminated cleanly.");
+    unsafe {
+        close(notify_fd);
+        close(kq);
+        notify_cancel(token);
+    }
 
+    log!("Terminated cleanly.");
     Ok(())
 }
