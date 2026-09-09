@@ -3,4 +3,9 @@ name = "macos-thermal-governor"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[profile.release]
+opt-level = "z"     # Optimize aggressively for binary size over raw throughput
+lto = true          # Fat Link-Time Optimization to eliminate dead functions across crates
+codegen-units = 1   # Reduces parallelism to allow maximum whole-program dead code elimination
+panic = "abort"     # Strips landing pads and call-frame unwinding metadata (DWARF / .eh_frame)
+strip = true        # Strips symbol tables and debug symbols at the linker stage
