@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "battery-care"
+name = "macos-thermal-governor"
 version = "0.1.0"
