@@ -7,11 +7,18 @@ const NOTIFY_KEY: &[u8] = b"com.apple.system.thermalpressurelevel\0";
 
 const EVFILT_READ: i16 = -1;
 const EVFILT_SIGNAL: i16 = -6;
+const EVFILT_TIMER: i16 = -7;
+
 const EV_ADD: u16 = 0x0001;
 const EV_ENABLE: u16 = 0x0004;
+const EV_DELETE: u16 = 0x0002;
+const EV_ONESHOT: u16 = 0x0010;
 
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
+
+// Cooldown delay before restoring burst power (e.g., 120 seconds)
+const COOLDOWN_MS: isize = 120_000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -205,7 +212,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         describe_pressure_level(current_state)
     );
 
-    let mut lpm_active = current_state >= 2;
+    let mut lpm_active = current_state >= 1;
     if lpm_active {
         set_low_power_mode(true);
     }
@@ -248,6 +255,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
+        // Cooldown timer expired: machine stayed at Level 0 for the required duration
+        if ev.filter == EVFILT_TIMER {
+            if lpm_active && current_state == 0 {
+                set_low_power_mode(false);
+                lpm_active = false;
+            }
+            continue;
+        }
+
         // Thermal event posted to notify_fd
         if ev.filter == EVFILT_READ && ev.ident == notify_fd as usize {
             let bytes_read = unsafe { read(notify_fd, token_buf.as_mut_ptr(), token_buf.len()) };
@@ -268,10 +284,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     describe_pressure_level(new_state)
                 );
 
-                let should_enable_lpm = new_state >= 2;
-                if should_enable_lpm != lpm_active {
-                    set_low_power_mode(should_enable_lpm);
-                    lpm_active = should_enable_lpm;
+                if new_state >= 1 {
+                    // Cancel any active cooldown timer and throttle
+                    let cancel_timer = Kevent {
+                        ident: 1,
+                        filter: EVFILT_TIMER,
+                        flags: EV_DELETE,
+                        fflags: 0,
+                        data: 0,
+                        udata: std::ptr::null_mut(),
+                    };
+                    unsafe { kevent(kq, &cancel_timer, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+
+                    if !lpm_active {
+                        set_low_power_mode(true);
+                        lpm_active = true;
+                    }
+                } else if new_state == 0 && lpm_active {
+                    // Arm a one-shot cooldown timer instead of immediately disabling LPM
+                    let arm_timer = Kevent {
+                        ident: 1,
+                        filter: EVFILT_TIMER,
+                        flags: EV_ADD | EV_ENABLE | EV_ONESHOT,
+                        fflags: 0,
+                        data: COOLDOWN_MS,
+                        udata: std::ptr::null_mut(),
+                    };
+                    unsafe { kevent(kq, &arm_timer, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
                 }
 
                 current_state = new_state;
