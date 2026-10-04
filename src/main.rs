@@ -1,392 +1,961 @@
-use std::ffi::{c_char, c_int, c_void};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "macos")]
+mod daemon {
+    use std::ffi::{c_char, c_int};
+    use std::io::{self, ErrorKind};
+    use std::mem::{self, MaybeUninit};
+    use std::os::fd::RawFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+    use std::ptr;
 
-const NOTIFY_STATUS_OK: u32 = 0;
-const NOTIFY_KEY: &[u8] = b"com.apple.system.thermalpressurelevel\0";
+    const NOTIFY_STATUS_OK: u32 = 0;
+    const NOTIFY_KEY: &[u8] = b"com.apple.system.thermalpressurelevel\0";
+    const ELEVATED_THRESHOLD: u64 = 1;
+    const COOLDOWN_MS: isize = 120_000;
+    const COOLDOWN_TIMER_ID: usize = 1;
 
-const EVFILT_READ: i16 = -1;
-const EVFILT_SIGNAL: i16 = -6;
-const EVFILT_TIMER: i16 = -7;
-
-const EV_ADD: u16 = 0x0001;
-const EV_ENABLE: u16 = 0x0004;
-const EV_DELETE: u16 = 0x0002;
-const EV_ONESHOT: u16 = 0x0010;
-
-const SIGINT: c_int = 2;
-const SIGTERM: c_int = 15;
-
-// Cooldown delay before restoring burst power (e.g., 120 seconds)
-const COOLDOWN_MS: isize = 120_000;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct Kevent {
-    ident: usize,
-    filter: i16,
-    flags: u16,
-    fflags: u32,
-    data: isize,
-    udata: *mut c_void,
-}
-
-#[link(name = "System")]
-unsafe extern "C" {
-    fn notify_register_file_descriptor(
-        name: *const c_char,
-        notify_fd: *mut c_int,
-        flags: c_int,
-        out_token: *mut c_int,
-    ) -> u32;
-
-    fn notify_get_state(token: c_int, state64: *mut u64) -> u32;
-    fn notify_cancel(token: c_int) -> u32;
-
-    fn kqueue() -> c_int;
-    fn kevent(
-        kq: c_int,
-        changelist: *const Kevent,
-        nchanges: c_int,
-        eventlist: *mut Kevent,
-        nevents: c_int,
-        timeout: *const c_void,
-    ) -> c_int;
-
-    fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
-    fn read(fd: c_int, buf: *mut u8, count: usize) -> isize;
-    fn close(fd: c_int) -> c_int;
-}
-
-fn format_timestamp() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let sec = secs % 60;
-    let min = (secs / 60) % 60;
-    let hour = (secs / 3600) % 24;
-
-    let days = (secs / 86400) as i64;
-    let z = days + 719468;
-    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let mut y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    if m <= 2 {
-        y += 1;
+    #[link(name = "System")]
+    unsafe extern "C" {
+        fn notify_register_file_descriptor(
+            name: *const c_char,
+            notify_fd: *mut c_int,
+            flags: c_int,
+            out_token: *mut c_int,
+        ) -> u32;
+        fn notify_get_state(token: c_int, state64: *mut u64) -> u32;
+        fn notify_cancel(token: c_int) -> u32;
     }
 
-    format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02} UTC")
-}
+    macro_rules! log {
+        ($($arg:tt)*) => {{
+            eprintln!("[thermal-lpm] {}", format_args!($($arg)*));
+        }};
+    }
 
-macro_rules! log {
-    ($($arg:tt)*) => {{
-        eprintln!("[{}] {}", format_timestamp(), format_args!($($arg)*));
-    }};
-}
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Profile {
+        Battery,
+        Charger,
+    }
 
-extern "C" fn handle_signal(_: c_int) {
-    // No-op: kevent catches EVFILT_SIGNAL synchronously.
-    // Registering a trivial handler prevents Darwin's default SIG_DFL termination.
-}
+    impl Profile {
+        const ALL: [Self; 2] = [Self::Battery, Self::Charger];
 
-#[derive(Debug, Default, Clone, Copy)]
-struct UserLpmState {
-    battery_manual: bool,
-    ac_manual: bool,
-}
+        fn flag(self) -> &'static str {
+            match self {
+                Self::Battery => "-b",
+                Self::Charger => "-c",
+            }
+        }
 
-fn query_user_lpm_state() -> UserLpmState {
-    let output = Command::new("/usr/bin/pmset")
-        .args(["-g", "custom"])
-        .output();
+        fn name(self) -> &'static str {
+            match self {
+                Self::Battery => "battery",
+                Self::Charger => "charger",
+            }
+        }
+    }
 
-    let mut state = UserLpmState::default();
-    if let Ok(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut current_section = "";
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct LpmSnapshot {
+        battery: Option<bool>,
+        charger: Option<bool>,
+    }
 
-        for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("Battery Power:") {
-            current_section = "battery";
-        } else if trimmed.starts_with("AC Power:") {
-            current_section = "ac";
-        } else {
-            let mut tokens = trimmed.split_whitespace();
-            if tokens.next() == Some("lowpowermode") {
-                let is_one = tokens.next() == Some("1");
-                if current_section == "battery" {
-                    state.battery_manual = is_one;
-                } else if current_section == "ac" {
-                    state.ac_manual = is_one;
+    impl LpmSnapshot {
+        fn get(self, profile: Profile) -> Option<bool> {
+            match profile {
+                Profile::Battery => self.battery,
+                Profile::Charger => self.charger,
+            }
+        }
+
+        fn insert(&mut self, profile: Profile, value: bool) -> io::Result<()> {
+            let slot = match profile {
+                Profile::Battery => &mut self.battery,
+                Profile::Charger => &mut self.charger,
+            };
+
+            if slot.replace(value).is_some() {
+                return Err(invalid_data(format!(
+                    "duplicate lowpowermode value for {} profile",
+                    profile.name()
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Ownership {
+        /// LPM is currently off and this daemon may claim the profile.
+        Eligible,
+        /// This daemon successfully changed the profile from off to on.
+        Daemon,
+        /// The profile is user/system managed. Never touch it again this run.
+        External,
+        /// The profile was not safely observable. Fail closed.
+        Unavailable,
+    }
+
+    #[derive(Debug)]
+    struct LpmController {
+        battery: Ownership,
+        charger: Ownership,
+    }
+
+    impl LpmController {
+        fn new(snapshot: LpmSnapshot) -> Self {
+            Self {
+                battery: Self::initial_state(snapshot.battery),
+                charger: Self::initial_state(snapshot.charger),
+            }
+        }
+
+        fn initial_state(value: Option<bool>) -> Ownership {
+            match value {
+                Some(false) => Ownership::Eligible,
+                Some(true) => Ownership::External,
+                None => Ownership::Unavailable,
+            }
+        }
+
+        fn state(&self, profile: Profile) -> Ownership {
+            match profile {
+                Profile::Battery => self.battery,
+                Profile::Charger => self.charger,
+            }
+        }
+
+        fn set_state(&mut self, profile: Profile, state: Ownership) {
+            match profile {
+                Profile::Battery => self.battery = state,
+                Profile::Charger => self.charger = state,
+            }
+        }
+
+        fn owns_any(&self) -> bool {
+            Profile::ALL
+                .iter()
+                .copied()
+                .any(|profile| self.state(profile) == Ownership::Daemon)
+        }
+
+        fn log_initial_state(&self) {
+            for profile in Profile::ALL {
+                match self.state(profile) {
+                    Ownership::Eligible => {
+                        log!("{} profile is eligible for daemon control", profile.name());
+                    }
+                    Ownership::External => {
+                        log!(
+                            "{} profile already has LPM enabled; leaving it externally managed",
+                            profile.name()
+                        );
+                    }
+                    Ownership::Unavailable => {
+                        log!(
+                            "{} profile is not safely observable; it will not be modified",
+                            profile.name()
+                        );
+                    }
+                    Ownership::Daemon => unreachable!(),
+                }
+            }
+        }
+
+        fn enable_for_eligible_profiles(&mut self) {
+            let snapshot = match query_lpm_state() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    log!("Cannot verify LPM state; no settings changed: {error}");
+                    return;
+                }
+            };
+
+            for profile in Profile::ALL {
+                let observed = snapshot.get(profile);
+
+                match (self.state(profile), observed) {
+                    // If our expected ON value became OFF, something external won.
+                    // Relinquish the profile and never fight the user's setting.
+                    (Ownership::Daemon, Some(false)) => {
+                        log!(
+                            "{} profile changed externally; relinquishing daemon ownership",
+                            profile.name()
+                        );
+                        self.set_state(profile, Ownership::External);
+                    }
+                    (Ownership::Daemon, _) => {}
+
+                    // A profile that becomes ON before we claim it is external.
+                    (Ownership::Eligible, Some(true)) => {
+                        log!(
+                            "{} profile was enabled externally; leaving it untouched",
+                            profile.name()
+                        );
+                        self.set_state(profile, Ownership::External);
+                    }
+                    (Ownership::Eligible, Some(false)) => self.claim(profile),
+                    (Ownership::Eligible, None) => {
+                        self.set_state(profile, Ownership::Unavailable);
+                    }
+
+                    // External ownership is sticky for the lifetime of the process.
+                    (Ownership::External, _) => {}
+
+                    // A profile can appear later (hardware/output differences). Re-evaluate
+                    // it, but still never take over a value that is already ON.
+                    (Ownership::Unavailable, Some(true)) => {
+                        self.set_state(profile, Ownership::External);
+                    }
+                    (Ownership::Unavailable, Some(false)) => {
+                        self.set_state(profile, Ownership::Eligible);
+                        self.claim(profile);
+                    }
+                    (Ownership::Unavailable, None) => {}
+                }
+            }
+        }
+
+        fn claim(&mut self, profile: Profile) {
+            match query_lpm_state()
+                .ok()
+                .and_then(|snapshot| snapshot.get(profile))
+            {
+                Some(false) => {}
+                Some(true) => {
+                    self.set_state(profile, Ownership::External);
+                    log!(
+                        "{} profile was enabled externally before claiming it; \
+                         leaving it untouched",
+                        profile.name()
+                    );
+                    return;
+                }
+                None => {
+                    self.set_state(profile, Ownership::Unavailable);
+                    log!(
+                        "{} profile could not be verified immediately before claiming; \
+                         leaving it untouched",
+                        profile.name()
+                    );
+                    return;
+                }
+            }
+
+            match set_lpm(profile, true) {
+                Ok(()) => {
+                    match query_lpm_state().ok().and_then(|snapshot| snapshot.get(profile)) {
+                        Some(true) => {
+                            self.set_state(profile, Ownership::Daemon);
+                            log!("LPM enabled for {} profile (daemon-owned)", profile.name());
+                        }
+                        Some(false) => {
+                            self.set_state(profile, Ownership::External);
+                            log!(
+                                "{} profile was changed externally while claiming it; \
+                                 relinquishing ownership",
+                                profile.name()
+                            );
+                        }
+                        None => {
+                            self.set_state(profile, Ownership::Daemon);
+                            log!(
+                                "{} profile could not be verified after enabling; retaining \
+                                 daemon ownership for safe restoration",
+                                profile.name()
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    log!("Failed to enable LPM for {} profile: {error}", profile.name());
+                }
+            }
+        }
+
+        fn restore_owned(&mut self, reason: &str) {
+            if !self.owns_any() {
+                return;
+            }
+
+            let snapshot = match query_lpm_state() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if reason == "shutdown" {
+                        log!(
+                            "Cannot verify LPM state during shutdown; attempting direct \
+                             restoration of daemon-owned profiles: {error}"
+                        );
+                        for profile in Profile::ALL {
+                            if self.state(profile) != Ownership::Daemon {
+                                continue;
+                            }
+
+                            match set_lpm(profile, false) {
+                                Ok(()) => {
+                                    self.set_state(profile, Ownership::Eligible);
+                                    log!(
+                                        "Restored {} profile after shutdown using daemon \
+                                         ownership record",
+                                        profile.name()
+                                    );
+                                }
+                                Err(error) => {
+                                    log!(
+                                        "Failed to restore {} profile during shutdown: {error}",
+                                        profile.name()
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        log!(
+                            "Cannot verify LPM state during {reason}; no settings changed: {error}"
+                        );
+                    }
+                    return;
+                }
+            };
+
+            for profile in Profile::ALL {
+                if self.state(profile) != Ownership::Daemon {
+                    continue;
+                }
+
+                match snapshot.get(profile) {
+                    Some(true) => match set_lpm(profile, false) {
+                        Ok(()) => {
+                            self.set_state(profile, Ownership::Eligible);
+                            log!("Restored {} profile after {reason}", profile.name());
+                        }
+                        Err(error) => {
+                            log!("Failed to restore {} profile: {error}", profile.name());
+                        }
+                    },
+                    Some(false) => {
+                        // Someone else already changed it. Do not write over them.
+                        self.set_state(profile, Ownership::External);
+                        log!(
+                            "{} profile changed externally before {reason}; not overwriting it",
+                            profile.name()
+                        );
+                    }
+                    None => {
+                        // Fail closed. Keep the ownership record so a later retry can
+                        // restore it if the profile becomes observable again.
+                        log!(
+                            "{} profile is unobservable during {reason}; not writing",
+                            profile.name()
+                        );
+                    }
                 }
             }
         }
     }
-    }
-    state
-}
 
-fn set_low_power_mode(enable: bool, user_state: &UserLpmState) {
-    let val = if enable { "1" } else { "0" };
-    // Only modify profiles where the user has NOT manually set Low Power Mode
-    let targets = [
-        (!user_state.battery_manual, "-b"),
-        (!user_state.ac_manual, "-c"),
-    ];
-
-    for (can_modify, flag) in targets {
-        if can_modify {
-            let status = Command::new("/usr/bin/pmset")
-                .args([flag, "lowpowermode", val])
-                .status();
-
-            match status {
-                Ok(s) if s.success() => log!("Low Power Mode ({flag}) -> {val}"),
-                Ok(s) => log!("pmset ({flag}) exited with status: {s}"),
-                Err(e) => log!("Failed to invoke pmset ({flag}): {e}"),
-            }
-        }
-    }
-}
-
-fn describe_pressure_level(level: u64) -> &'static str {
-    match level {
-        0 => "Nominal (Full performance)",
-        1 => "Moderate (Minor throttling / increased heat)",
-        2 => "Heavy (Significant throttling)",
-        3 => "Trapping (Emergency mitigation)",
-        4 => "Sleeping (Forced sleep)",
-        _ => "Unknown state",
-    }
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Intercept termination signals without executing default abort actions
-    unsafe {
-        signal(SIGTERM, handle_signal);
-        signal(SIGINT, handle_signal);
+    fn invalid_data(message: impl Into<String>) -> io::Error {
+        io::Error::new(ErrorKind::InvalidData, message.into())
     }
 
-    let mut notify_fd: c_int = -1;
-    let mut token: c_int = 0;
+    fn parse_lpm_snapshot(text: &str) -> io::Result<LpmSnapshot> {
+        let mut snapshot = LpmSnapshot::default();
+        let mut section = None;
 
-    let status = unsafe {
-        notify_register_file_descriptor(
-            NOTIFY_KEY.as_ptr() as *const c_char,
-            &mut notify_fd,
-            0,
-            &mut token,
-        )
-    };
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
 
-    if status != NOTIFY_STATUS_OK || notify_fd < 0 {
-        log!("Failed to register notification listener: {status}");
-        std::process::exit(1);
-    }
-
-    let kq = unsafe { kqueue() };
-    if kq < 0 {
-        log!("Failed to create kqueue descriptor");
-        unsafe {
-            close(notify_fd);
-            notify_cancel(token);
-        }
-        std::process::exit(1);
-    }
-
-    // Subscribe to incoming pipe data and OS termination signals in a single kernel queue
-    let change_list = [
-        Kevent {
-            ident: notify_fd as usize,
-            filter: EVFILT_READ,
-            flags: EV_ADD | EV_ENABLE,
-            fflags: 0,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        },
-        Kevent {
-            ident: SIGTERM as usize,
-            filter: EVFILT_SIGNAL,
-            flags: EV_ADD | EV_ENABLE,
-            fflags: 0,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        },
-        Kevent {
-            ident: SIGINT as usize,
-            filter: EVFILT_SIGNAL,
-            flags: EV_ADD | EV_ENABLE,
-            fflags: 0,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        },
-    ];
-
-    let register_status = unsafe {
-        kevent(
-            kq,
-            change_list.as_ptr(),
-            change_list.len() as c_int,
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null(),
-        )
-    };
-
-    if register_status < 0 {
-        log!("Failed to register kqueue filters");
-        unsafe {
-            close(notify_fd);
-            close(kq);
-            notify_cancel(token);
-        }
-        std::process::exit(1);
-    }
-
-    let user_state = query_user_lpm_state();
-    let all_user_enabled = user_state.battery_manual && user_state.ac_manual;
-    if user_state.battery_manual || user_state.ac_manual {
-        log!(
-            "User Low Power Mode detected (Battery: {}, AC: {}). Only unconfigured profiles will be managed.",
-            user_state.battery_manual,
-            user_state.ac_manual
-        );
-    }
-
-    let mut current_state: u64 = 0;
-    unsafe { notify_get_state(token, &mut current_state) };
-
-    log!(
-        "Started. Initial State: [{}] {}",
-        current_state,
-        describe_pressure_level(current_state)
-    );
-
-    let mut lpm_active = (current_state >= 1) && !all_user_enabled;
-    if lpm_active {
-        set_low_power_mode(true, &user_state);
-    }
-
-    let mut event = std::mem::MaybeUninit::<Kevent>::uninit();
-    let mut token_buf = [0u8; 4];
-
-    loop {
-        // Blocks indefinitely with NULL timeout until the kernel pushes an event
-        let n = unsafe {
-            kevent(
-                kq,
-                std::ptr::null(),
-                0,
-                event.as_mut_ptr(),
-                1,
-                std::ptr::null(), // NULL = 0 timer wakeups, pure interrupt-driven sleep
-            )
-        };
-
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(4) {
-                // EINTR: an unmonitored signal hit the thread, safely re-enter kevent
+            // Reset on *every* power section. This prevents an unknown section such
+            // as UPS Power from being mistaken for the previous Battery/AC section.
+            if line.ends_with("Power:") {
+                section = match line {
+                    "Battery Power:" => Some(Profile::Battery),
+                    "AC Power:" | "Charger Power:" => Some(Profile::Charger),
+                    _ => None,
+                };
                 continue;
             }
-            log!("kevent error: {err}");
-            break;
-        }
 
-        if n == 0 {
-            continue;
-        }
+            let Some(profile) = section else {
+                continue;
+            };
 
-        let ev = unsafe { event.assume_init() };
-
-        // Synchronous shutdown signal from launchctl or terminal
-        if ev.filter == EVFILT_SIGNAL {
-            log!("Received termination signal ({}), shutting down...", ev.ident);
-            break;
-        }
-
-        // Cooldown timer expired: machine stayed at Level 0 for the required duration
-        if ev.filter == EVFILT_TIMER {
-            if lpm_active && current_state == 0 {
-                set_low_power_mode(false, &user_state);
-                lpm_active = false;
+            let mut fields = line.split_whitespace();
+            if fields.next() != Some("lowpowermode") {
+                continue;
             }
-            continue;
+
+            let value = match fields.next() {
+                Some("0") => false,
+                Some("1") => true,
+                Some(value) => {
+                    return Err(invalid_data(format!(
+                        "unexpected lowpowermode value {value:?} in {} profile",
+                        profile.name()
+                    )));
+                }
+                None => {
+                    return Err(invalid_data(format!(
+                        "missing lowpowermode value in {} profile",
+                        profile.name()
+                    )));
+                }
+            };
+
+            snapshot.insert(profile, value)?;
         }
 
-        // Thermal event posted to notify_fd
-        if ev.filter == EVFILT_READ && ev.ident == notify_fd as usize {
-            let bytes_read = unsafe { read(notify_fd, token_buf.as_mut_ptr(), token_buf.len()) };
-            if bytes_read <= 0 {
-                log!("Notification pipe closed unexpectedly");
+        if snapshot.battery.is_none() && snapshot.charger.is_none() {
+            return Err(invalid_data(
+                "pmset output contained no supported lowpowermode profile",
+            ));
+        }
+
+        Ok(snapshot)
+    }
+
+    fn query_lpm_state() -> io::Result<LpmSnapshot> {
+        let output = Command::new("/usr/bin/pmset")
+            .args(["-g", "custom"])
+            .output()?;
+
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "pmset -g custom failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|error| invalid_data(format!("pmset returned invalid UTF-8: {error}")))?;
+        parse_lpm_snapshot(&stdout)
+    }
+
+    fn set_lpm(profile: Profile, enabled: bool) -> io::Result<()> {
+        let value = if enabled { "1" } else { "0" };
+        let output = Command::new("/usr/bin/pmset")
+            .args([profile.flag(), "lowpowermode", value])
+            .output()?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "pmset {} lowpowermode {value} failed ({}): {}",
+                profile.flag(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+
+    pub fn ensure_power_mode_permissions() -> io::Result<()> {
+        if unsafe { libc::geteuid() } == 0 {
+            return Ok(());
+        }
+
+        eprintln!("[thermal-lpm] Administrator privileges are required to change Low Power Mode.");
+        eprint!("[thermal-lpm] Restart automatically with administrator privileges? [y/n] ");
+        io::Write::flush(&mut io::stderr())?;
+
+        let mut answer = String::new();
+        loop {
+            answer.clear();
+            if io::stdin().read_line(&mut answer)? == 0 {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "cannot ask for administrator privileges without an interactive terminal",
+                ));
+            }
+
+            match answer.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" => break,
+                "n" | "no" => {
+                    eprintln!(
+                        "[thermal-lpm] Administrator privileges are required; exiting."
+                    );
+                    return Err(io::Error::new(
+                        ErrorKind::PermissionDenied,
+                        "administrator privileges declined",
+                    ));
+                }
+                _ => {
+                    eprint!("[thermal-lpm] Please answer y or n: ");
+                    io::Write::flush(&mut io::stderr())?;
+                }
+            }
+        }
+
+        let executable = std::env::current_exe()?;
+        let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+        eprintln!("[thermal-lpm] Restarting with administrator privileges...");
+
+        let error = Command::new("/usr/bin/sudo")
+            .arg(executable)
+            .args(arguments)
+            .exec();
+        Err(error)
+    }
+
+    struct NotifyRegistration {
+        fd: RawFd,
+        token: c_int,
+    }
+
+    impl NotifyRegistration {
+        fn new() -> io::Result<Self> {
+            let mut fd = -1;
+            let mut token = 0;
+            let status = unsafe {
+                // SAFETY: NOTIFY_KEY is NUL-terminated; fd/token are writable.
+                notify_register_file_descriptor(
+                    NOTIFY_KEY.as_ptr().cast::<c_char>(),
+                    &mut fd,
+                    0,
+                    &mut token,
+                )
+            };
+
+            if status != NOTIFY_STATUS_OK || fd < 0 {
+                if fd >= 0 {
+                    unsafe { libc::close(fd) };
+                }
+                return Err(io::Error::other(format!(
+                    "notify registration failed with status {status}"
+                )));
+            }
+
+            Ok(Self { fd, token })
+        }
+
+        fn state(&self) -> io::Result<u64> {
+            let mut state = 0_u64;
+            let status = unsafe {
+                // SAFETY: token is valid while self is alive; state is writable.
+                notify_get_state(self.token, &mut state)
+            };
+
+            if status == NOTIFY_STATUS_OK {
+                Ok(state)
+            } else {
+                Err(io::Error::other(format!(
+                    "notify_get_state failed with status {status}"
+                )))
+            }
+        }
+
+        fn read_token(&self) -> io::Result<c_int> {
+            // notify(3) writes the registration token to the descriptor in network
+            // byte order. Read it as a u32 and explicitly convert to host order
+            // before comparing it with the token returned at registration time.
+            let mut network_token = 0_u32;
+            let size = mem::size_of::<u32>();
+
+            loop {
+                let bytes_read = unsafe {
+                    // SAFETY: network_token is writable for exactly `size` bytes;
+                    // self.fd remains valid while this registration is alive.
+                    libc::read(
+                        self.fd,
+                        (&mut network_token as *mut u32).cast(),
+                        size,
+                    )
+                };
+
+                if bytes_read == size as isize {
+                    let host_token = u32::from_be(network_token);
+                    if host_token > c_int::MAX as u32 {
+                        return Err(invalid_data(format!(
+                            "notification token {host_token} does not fit in c_int"
+                        )));
+                    }
+                    return Ok(host_token as c_int);
+                }
+                if bytes_read == 0 {
+                    return Err(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "notification descriptor closed",
+                    ));
+                }
+                if bytes_read < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                return Err(invalid_data(format!(
+                    "short notification read: expected {size} bytes, got {bytes_read}"
+                )));
+            }
+        }
+    }
+
+    impl Drop for NotifyRegistration {
+        fn drop(&mut self) {
+            // notify_cancel() releases the file descriptor associated with the
+            // registration. Only close it ourselves if cancellation fails.
+            let status = unsafe { notify_cancel(self.token) };
+            if status != NOTIFY_STATUS_OK {
+                unsafe {
+                    let _ = libc::close(self.fd);
+                }
+            }
+        }
+    }
+
+    struct Kqueue {
+        fd: RawFd,
+    }
+
+    impl Kqueue {
+        fn new() -> io::Result<Self> {
+            let fd = unsafe { libc::kqueue() };
+            if fd < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(Self { fd })
+            }
+        }
+
+        fn register(&self, notify_fd: RawFd) -> io::Result<()> {
+            let changes = [
+                event(
+                    notify_fd as usize,
+                    libc::EVFILT_READ,
+                    libc::EV_ADD | libc::EV_ENABLE,
+                    0,
+                ),
+                event(
+                    libc::SIGTERM as usize,
+                    libc::EVFILT_SIGNAL,
+                    libc::EV_ADD | libc::EV_ENABLE,
+                    0,
+                ),
+                event(
+                    libc::SIGINT as usize,
+                    libc::EVFILT_SIGNAL,
+                    libc::EV_ADD | libc::EV_ENABLE,
+                    0,
+                ),
+            ];
+
+            let result = unsafe {
+                // SAFETY: changes is initialized and lives through the call.
+                libc::kevent(
+                    self.fd,
+                    changes.as_ptr(),
+                    changes.len() as c_int,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null(),
+                )
+            };
+
+            if result < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait(&self) -> io::Result<libc::kevent> {
+            let mut output = MaybeUninit::<libc::kevent>::uninit();
+
+            loop {
+                let result = unsafe {
+                    // SAFETY: output has room for one event. Null timeout blocks.
+                    libc::kevent(
+                        self.fd,
+                        ptr::null(),
+                        0,
+                        output.as_mut_ptr(),
+                        1,
+                        ptr::null(),
+                    )
+                };
+
+                if result > 0 {
+                    let event = unsafe { output.assume_init() };
+                    // `libc::kevent` is packed on Darwin. Copy potentially
+                    // unaligned fields before using them in ordinary Rust code.
+                    let flags = event.flags;
+                    let data = event.data;
+                    if flags & libc::EV_ERROR != 0 && data != 0 {
+                        return Err(io::Error::from_raw_os_error(data as i32));
+                    }
+                    return Ok(event);
+                }
+                if result == 0 {
+                    continue;
+                }
+
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    return Err(error);
+                }
+            }
+        }
+
+        fn arm_cooldown(&self) -> io::Result<()> {
+            self.submit(event(
+                COOLDOWN_TIMER_ID,
+                libc::EVFILT_TIMER,
+                libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+                COOLDOWN_MS,
+            ))
+        }
+
+        fn cancel_cooldown(&self) -> io::Result<()> {
+            match self.submit(event(
+                COOLDOWN_TIMER_ID,
+                libc::EVFILT_TIMER,
+                libc::EV_DELETE,
+                0,
+            )) {
+                Ok(()) => Ok(()),
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+
+        fn submit(&self, change: libc::kevent) -> io::Result<()> {
+            let result = unsafe {
+                libc::kevent(
+                    self.fd,
+                    &change,
+                    1,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null(),
+                )
+            };
+            if result < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for Kqueue {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = libc::close(self.fd);
+            }
+        }
+    }
+
+    fn event(ident: usize, filter: i16, flags: u16, data: isize) -> libc::kevent {
+        libc::kevent {
+            ident,
+            filter,
+            flags,
+            fflags: 0,
+            data,
+            udata: ptr::null_mut(),
+        }
+    }
+
+    extern "C" fn signal_handler(_: c_int) {}
+
+    fn install_signal_handler(signal: c_int) -> io::Result<()> {
+        let mut action: libc::sigaction = unsafe { mem::zeroed() };
+        action.sa_sigaction = signal_handler as libc::sighandler_t;
+        action.sa_flags = 0;
+
+        if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0
+            || unsafe { libc::sigaction(signal, &action, ptr::null_mut()) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn pressure_name(level: u64) -> &'static str {
+        match level {
+            0 => "nominal",
+            1 => "elevated level 1",
+            2 => "level 2",
+            3 => "level 3",
+            4 => "level 4",
+            _ => "unknown level",
+        }
+    }
+
+    pub fn run() -> io::Result<()> {
+        install_signal_handler(libc::SIGTERM)?;
+        install_signal_handler(libc::SIGINT)?;
+
+        let notify = NotifyRegistration::new()?;
+        let kqueue = Kqueue::new()?;
+        kqueue.register(notify.fd)?;
+
+        let mut controller = LpmController::new(query_lpm_state()?);
+        controller.log_initial_state();
+
+        let mut pressure = notify.state()?;
+        log!("Started at thermal pressure {} ({pressure})", pressure_name(pressure));
+
+        if pressure >= ELEVATED_THRESHOLD {
+            controller.enable_for_eligible_profiles();
+        }
+
+        let mut cooldown_armed = false;
+
+        loop {
+            let ev = match kqueue.wait() {
+                Ok(event) => event,
+                Err(error) => {
+                    log!("kqueue wait failed: {error}");
+                    break;
+                }
+            };
+
+            // `libc::kevent` is packed on Darwin, so copy fields into aligned
+            // locals before comparisons/formatting.
+            let ev_filter = ev.filter;
+            let ev_ident = ev.ident;
+
+            if ev_filter == libc::EVFILT_SIGNAL {
+                log!("Received termination signal {ev_ident}; shutting down");
                 break;
             }
 
-            let mut new_state: u64 = 0;
-            let query_status = unsafe { notify_get_state(token, &mut new_state) };
+            if ev_filter == libc::EVFILT_TIMER && ev_ident == COOLDOWN_TIMER_ID {
+                cooldown_armed = false;
+                if pressure == 0 {
+                    controller.restore_owned("cooldown");
 
-            if query_status == NOTIFY_STATUS_OK && new_state != current_state {
-                log!(
-                    "Transition: [{}] {} -> [{}] {}",
-                    current_state,
-                    describe_pressure_level(current_state),
-                    new_state,
-                    describe_pressure_level(new_state)
-                );
-
-                if new_state >= 1 {
-                    // Cancel any active cooldown timer and throttle
-                    let cancel_timer = Kevent {
-                        ident: 1,
-                        filter: EVFILT_TIMER,
-                        flags: EV_DELETE,
-                        fflags: 0,
-                        data: 0,
-                        udata: std::ptr::null_mut(),
-                    };
-                    unsafe { kevent(kq, &cancel_timer, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
-
-                    if !lpm_active && !all_user_enabled {
-                        set_low_power_mode(true, &user_state);
-                        lpm_active = true;
+                    // Retry transient query/write failures instead of stranding a
+                    // daemon-owned setting while the machine stays nominal.
+                    if controller.owns_any() {
+                        match kqueue.arm_cooldown() {
+                            Ok(()) => cooldown_armed = true,
+                            Err(error) => log!("Failed to arm restore retry: {error}"),
+                        }
                     }
-                } else if new_state == 0 && lpm_active {
-                    // Arm a one-shot cooldown timer instead of immediately disabling LPM
-                    let arm_timer = Kevent {
-                        ident: 1,
-                        filter: EVFILT_TIMER,
-                        flags: EV_ADD | EV_ENABLE | EV_ONESHOT,
-                        fflags: 0,
-                        data: COOLDOWN_MS,
-                        udata: std::ptr::null_mut(),
-                    };
-                    unsafe { kevent(kq, &arm_timer, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
                 }
+                continue;
+            }
 
-                current_state = new_state;
+            if ev_filter != libc::EVFILT_READ || ev_ident != notify.fd as usize {
+                continue;
+            }
+
+            let delivered_token = match notify.read_token() {
+                Ok(token) => token,
+                Err(error) => {
+                    log!("Notification read failed: {error}");
+                    break;
+                }
+            };
+
+            if delivered_token != notify.token {
+                log!("Ignoring unexpected notification token {delivered_token}");
+                continue;
+            }
+
+            let next = match notify.state() {
+                Ok(value) => value,
+                Err(error) => {
+                    log!("Thermal state query failed: {error}");
+                    continue;
+                }
+            };
+
+            if next == pressure {
+                continue;
+            }
+
+            log!(
+                "Thermal transition: {} ({pressure}) -> {} ({next})",
+                pressure_name(pressure),
+                pressure_name(next)
+            );
+
+            if next >= ELEVATED_THRESHOLD {
+                if cooldown_armed {
+                    match kqueue.cancel_cooldown() {
+                        Ok(()) => cooldown_armed = false,
+                        Err(error) => log!("Failed to cancel cooldown: {error}"),
+                    }
+                }
+                controller.enable_for_eligible_profiles();
+            } else if controller.owns_any() && !cooldown_armed {
+                match kqueue.arm_cooldown() {
+                    Ok(()) => {
+                        cooldown_armed = true;
+                        log!("Nominal state reached; cooldown armed");
+                    }
+                    Err(error) => log!("Failed to arm cooldown: {error}"),
+                }
+            }
+
+            pressure = next;
+        }
+
+        if cooldown_armed {
+            if let Err(error) = kqueue.cancel_cooldown() {
+                log!("Failed to cancel cooldown during shutdown: {error}");
             }
         }
+
+        controller.restore_owned("shutdown");
+        log!("Terminated cleanly");
+        Ok(())
     }
 
-    // Guaranteed cleanup before exit
-    if lpm_active {
-        set_low_power_mode(false, &user_state);
-    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
-    unsafe {
-        close(notify_fd);
-        close(kq);
-        notify_cancel(token);
-    }
+        #[test]
+        fn parses_known_profiles() {
+            let input = "Battery Power:\n lowpowermode 0\nAC Power:\n lowpowermode 1\n";
+            let result = parse_lpm_snapshot(input).unwrap();
+            assert_eq!(result.battery, Some(false));
+            assert_eq!(result.charger, Some(true));
+        }
 
-    log!("Terminated cleanly.");
-    Ok(())
+        #[test]
+        fn unknown_section_does_not_leak_into_previous_profile() {
+            let input = concat!(
+                "Battery Power:\n lowpowermode 0\n",
+                "UPS Power:\n lowpowermode 1\n",
+                "AC Power:\n lowpowermode 0\n"
+            );
+            let result = parse_lpm_snapshot(input).unwrap();
+            assert_eq!(result.battery, Some(false));
+            assert_eq!(result.charger, Some(false));
+        }
+
+        #[test]
+        fn accepts_charger_header_alias() {
+            let input = "Charger Power:\n lowpowermode 1\n";
+            let result = parse_lpm_snapshot(input).unwrap();
+            assert_eq!(result.charger, Some(true));
+        }
+
+        #[test]
+        fn rejects_invalid_low_power_value() {
+            assert!(parse_lpm_snapshot("Battery Power:\n lowpowermode 7\n").is_err());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn main() {
+    if let Err(error) = daemon::ensure_power_mode_permissions().and_then(|()| daemon::run()) {
+        eprintln!("[thermal-lpm] fatal error: {error}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("thermal-lpm-daemon supports macOS only");
+    std::process::exit(1);
 }
